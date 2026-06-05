@@ -45,6 +45,7 @@ Each details line is a JSON object:
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -246,6 +247,20 @@ def append_snapshot(path: Path, ts: str, league: str, category: str, data: dict)
         f.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
+def run_report(data_dir: Path) -> None:
+    """Regenerate report.html by invoking report.py as a subprocess."""
+    report_script = Path(__file__).with_name("report.py")
+    try:
+        subprocess.run(
+            [sys.executable, str(report_script), "--data-dir", str(data_dir)],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        print(f"  [REPORT] report.py exited with code {e.returncode}", file=sys.stderr)
+    except FileNotFoundError:
+        print(f"  [REPORT] report.py not found at {report_script}", file=sys.stderr)
+
+
 def poll_once(league: str, data_dir: Path):
     ts = utc_now()
     print(f"\n[{ts}] Polling {len(ENDPOINTS)} endpoints for '{league}'…")
@@ -295,10 +310,13 @@ def main():
     try:
         while True:
             iteration += 1
-            poll_once(args.league, data_dir)
+            ok = poll_once(args.league, data_dir)
 
             if args.once:
                 break
+
+            if ok > 0:
+                run_report(data_dir)
 
             if stop_at and datetime.now(timezone.utc) >= stop_at:
                 print(f"\nDuration elapsed — exiting after {iteration} poll(s).")
