@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(.venv\\\\Scripts\\\\python.exe report.py)",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe debug_ulaman.py)",
+      "PowerShell(.venv\\\\Scripts\\\\python.exe collect.py --once 2>&1)"
+    ]
+  }
+}
