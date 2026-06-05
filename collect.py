@@ -22,7 +22,7 @@ Output directory (./data/):
     unique_jewellery.jsonl
     divination_cards.jsonl
 
-    details/<stem>.jsonl — per-item detail records (fetched once per item ID)
+    details/<stem>.jsonl — per-item detail records (refreshed every 12 hours)
 
 Each snapshot line is a JSON object:
     {
@@ -60,6 +60,7 @@ DEFAULT_LEAGUE   = "Runes of Aldur"
 DEFAULT_INTERVAL = 30 * 60   # 30 minutes (poe.ninja updates ~hourly)
 DATA_DIR         = Path("data")
 DETAILS_DIR      = DATA_DIR / "details"
+DETAILS_TTL      = 12 * 3600  # seconds before a detail record is re-fetched
 
 HEADERS = {
     "User-Agent": (
@@ -91,10 +92,10 @@ ENDPOINTS = [
     ("liquid_emotions",   POE2_CURRENCY_BASE, "Delirium"),
     ("catalysts",         POE2_CURRENCY_BASE, "Breach"),
     ("verisium",          POE2_CURRENCY_BASE, "Verisium"),
-    ("skill_gems",        POE2_ITEM_BASE, "LineageSupportGems"),
-    ("unique_weapons",    POE2_ITEM_BASE, "UniqueWeapons"),
-    ("unique_armours",    POE2_ITEM_BASE, "UniqueArmours"),
-    ("unique_jewellery",  POE2_ITEM_BASE, "UniqueJewels"),
+    # ("skill_gems",        POE2_ITEM_BASE, "LineageSupportGems"),
+    # ("unique_weapons",    POE2_ITEM_BASE, "UniqueWeapons"),
+    # ("unique_armours",    POE2_ITEM_BASE, "UniqueArmours"),
+    # ("unique_jewellery",  POE2_ITEM_BASE, "UniqueJewels"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -137,11 +138,11 @@ def fetch_details(league: str, type_name: str, item_id: str) -> dict | None:
     return None
 
 
-def load_seen_ids(details_path: Path) -> set:
-    """Return the set of item IDs already stored in a details JSONL file."""
-    seen: set = set()
+def load_details_map(details_path: Path) -> dict:
+    """Return {item_id: record} from a details JSONL file."""
+    records: dict = {}
     if not details_path.exists():
-        return seen
+        return records
     with open(details_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -149,10 +150,21 @@ def load_seen_ids(details_path: Path) -> set:
                 continue
             try:
                 rec = json.loads(line)
-                seen.add(rec.get("id"))
+                item_id = rec.get("id")
+                if item_id:
+                    records[item_id] = rec
             except json.JSONDecodeError:
                 pass
-    return seen
+    return records
+
+
+def is_stale(ts_str: str) -> bool:
+    """Return True if ts_str is older than DETAILS_TTL seconds."""
+    try:
+        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - ts).total_seconds() > DETAILS_TTL
+    except (ValueError, AttributeError):
+        return True
 
 
 def line_item_id(line: dict, id_map: dict | None = None) -> str | None:
@@ -174,7 +186,7 @@ def line_item_id(line: dict, id_map: dict | None = None) -> str | None:
 
 def collect_details(league: str, type_name: str, lines: list, details_path: Path,
                     items: list | None = None):
-    """Fetch and append details for any item IDs not yet in details_path."""
+    """Fetch details for new items and refresh any records older than DETAILS_TTL."""
     if not lines:
         return
     # Build short-id → detailsId map from the items metadata (exchange endpoints)
@@ -183,33 +195,36 @@ def collect_details(league: str, type_name: str, lines: list, details_path: Path
         for item in items:
             if "id" in item and "detailsId" in item:
                 id_map[str(item["id"])] = item["detailsId"]
-    seen = load_seen_ids(details_path)
-    new_ids = [
+    existing = load_details_map(details_path)
+    to_fetch = [
         item_id for line in lines
-        if (item_id := line_item_id(line, id_map)) and item_id not in seen
+        if (item_id := line_item_id(line, id_map)) and (
+            item_id not in existing or is_stale(existing[item_id].get("ts", ""))
+        )
     ]
-    if not new_ids:
+    if not to_fetch:
         return
     details_path.parent.mkdir(parents=True, exist_ok=True)
     ts = utc_now()
     fetched = 0
-    with open(details_path, "a", encoding="utf-8") as f:
-        for item_id in new_ids:
-            data = fetch_details(league, type_name, item_id)
-            if data is None:
-                continue
-            record = {
-                "ts":       ts,
-                "league":   league,
-                "category": type_name,
-                "id":       item_id,
-                "details":  data,
-            }
-            f.write(json.dumps(record, separators=(",", ":")) + "\n")
-            fetched += 1
-            time.sleep(1)   # be polite
+    for item_id in to_fetch:
+        data = fetch_details(league, type_name, item_id)
+        if data is None:
+            continue
+        existing[item_id] = {
+            "ts":       ts,
+            "league":   league,
+            "category": type_name,
+            "id":       item_id,
+            "details":  data,
+        }
+        fetched += 1
+        time.sleep(1)   # be polite
     if fetched:
-        print(f"    + {fetched} new detail(s) -> {details_path.name}")
+        with open(details_path, "w", encoding="utf-8") as f:
+            for rec in existing.values():
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        print(f"    + {fetched} detail(s) refreshed -> {details_path.name}")
 
 
 def append_snapshot(path: Path, ts: str, league: str, category: str, data: dict):
