@@ -45,24 +45,70 @@ def load_items(data_dir: Path) -> list[dict]:
     return list(items.values())
 
 
-def linreg_slope(values: list[float]) -> float:
-    n = len(values)
+def load_hourly(data_dir: Path) -> dict[str, dict[str, list[dict]]]:
+    """
+    Read all hourly snapshots from data/<stem>.jsonl.
+    Returns {detailsId: {"exalted": [points], "divine": [points]}}
+    where each point is {timestamp, rate, volumePrimaryValue}.
+    primaryValue in each snapshot is divine-denominated; multiply by core.rates.exalted for ex rate.
+    """
+    result: dict[str, dict[str, list[dict]]] = {}
+    for stem in STEMS:
+        path = data_dir / f"{stem}.jsonl"
+        if not path.exists():
+            continue
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                snap = json.loads(raw)
+                ts = snap.get("ts", "")
+                ex_rate = snap.get("core", {}).get("rates", {}).get("exalted")
+                if not ex_rate:
+                    continue
+                id_map = {
+                    item["id"]: item.get("detailsId") or item["id"]
+                    for item in snap.get("items", [])
+                    if item.get("id")
+                }
+                for entry in snap.get("lines", []):
+                    pv = entry.get("primaryValue")
+                    if not pv or pv <= 0:
+                        continue
+                    details_id = id_map.get(entry.get("id", ""), entry.get("id", ""))
+                    vol = entry.get("volumePrimaryValue", 0)
+                    bucket = result.setdefault(details_id, {"exalted": [], "divine": []})
+                    bucket["exalted"].append({"timestamp": ts, "rate": pv * ex_rate, "volumePrimaryValue": vol})
+                    bucket["divine"].append({"timestamp": ts, "rate": pv, "volumePrimaryValue": vol})
+    return result
+
+
+def linreg_slope(xs: list[float], ys: list[float]) -> float:
+    n = len(xs)
     if n < 2:
         return 0.0
-    mean_x = (n - 1) / 2
-    mean_y = sum(values) / n
-    num = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(values))
-    den = sum((i - mean_x) ** 2 for i in range(n))
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    num = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
+    den = sum((x - mean_x) ** 2 for x in xs)
     return num / den if den else 0.0
 
 
-def analyze_pair(history: list[dict], min_vol: float) -> dict | None:
-    if len(history) < 3:
+def analyze_pair(history: list[dict], min_vol: float, extra: list[dict] | None = None) -> dict | None:
+    all_pts = list(history) + (extra or [])
+    if len(all_pts) < 3:
         return None
 
-    sorted_h = sorted(history, key=lambda x: x.get("timestamp", ""))
+    # Sort, then deduplicate by exact timestamp (keep last seen value per timestamp)
+    all_pts.sort(key=lambda x: x.get("timestamp", ""))
+    seen: dict[str, dict] = {}
+    for pt in all_pts:
+        seen[pt.get("timestamp", "")] = pt
+    sorted_h = sorted(seen.values(), key=lambda x: x.get("timestamp", ""))
+
     rates = [h["rate"] for h in sorted_h if "rate" in h]
-    vols = [h.get("volumePrimaryValue", 0) for h in sorted_h]
+    vols  = [h.get("volumePrimaryValue", 0) for h in sorted_h]
 
     if len(rates) < 3:
         return None
@@ -75,7 +121,18 @@ def analyze_pair(history: list[dict], min_vol: float) -> dict | None:
     if mean_rate == 0:
         return None
 
-    slope = linreg_slope(rates)
+    # Time-based regression: x-axis is days since oldest point
+    timestamps = [h.get("timestamp", "") for h in sorted_h if "rate" in h]
+    t0 = datetime.fromisoformat(timestamps[0].replace("Z", "+00:00"))
+
+    def to_days(ts_str: str) -> float:
+        try:
+            return (datetime.fromisoformat(ts_str.replace("Z", "+00:00")) - t0).total_seconds() / 86400
+        except Exception:
+            return 0.0
+
+    xs = [to_days(ts) for ts in timestamps]
+    slope = linreg_slope(xs, rates)  # rate change per day
     trend_pct = slope / mean_rate * 100
 
     variance = sum((r - mean_rate) ** 2 for r in rates) / len(rates)
@@ -88,13 +145,18 @@ def analyze_pair(history: list[dict], min_vol: float) -> dict | None:
         "score": trend_pct / (cv + 0.01),
         "current_rate": rates[-1],
         "rates": rates,
-        "timestamps": [h.get("timestamp", "") for h in sorted_h],
+        "timestamps": timestamps,
     }
 
 
 def make_sparkline(rates: list[float], width: int = 80, height: int = 30) -> str:
     if len(rates) < 2:
         return ""
+    # Downsample to keep SVG compact
+    MAX_PTS = 80
+    if len(rates) > MAX_PTS:
+        step = (len(rates) - 1) / (MAX_PTS - 1)
+        rates = [rates[round(i * step)] for i in range(MAX_PTS)]
     mn, mx = min(rates), max(rates)
     r_range = mx - mn
 
@@ -116,7 +178,8 @@ def make_sparkline(rates: list[float], width: int = 80, height: int = 30) -> str
     )
 
 
-def build_rows(items: list[dict], min_vol: float) -> tuple[list[dict], str, str, str]:
+def build_rows(items: list[dict], min_vol: float, data_dir: Path) -> tuple[list[dict], str, str, str]:
+    hourly = load_hourly(data_dir)
     rows = []
     league = ""
     all_timestamps: list[str] = []
@@ -128,13 +191,15 @@ def build_rows(items: list[dict], min_vol: float) -> tuple[list[dict], str, str,
         details = record.get("details", {})
         item_info = details.get("item", {})
         pair_map = {p["id"]: p for p in details.get("pairs", [])}
+        item_id = record.get("id", "")
+        hourly_item = hourly.get(item_id, {})
 
         analyses: dict[str, dict] = {}
         for base in BASE_CURRENCIES:
             pair = pair_map.get(base)
             if not pair:
                 continue
-            result = analyze_pair(pair.get("history", []), min_vol)
+            result = analyze_pair(pair.get("history", []), min_vol, extra=hourly_item.get(base))
             if result:
                 analyses[base] = result
                 all_timestamps.extend(result["timestamps"])
@@ -576,7 +641,7 @@ def main() -> None:
     items = load_items(data_dir)
     print(f"  Loaded {len(items)} items across {len(STEMS)} categories")
 
-    rows, league, date_min, date_max = build_rows(items, args.min_vol)
+    rows, league, date_min, date_max = build_rows(items, args.min_vol, data_dir)
     both_up = sum(1 for r in rows if r["both_up"])
     print(f"  Passed filters (min-vol={args.min_vol}): {len(rows)} items, {both_up} trending up in both Ex + Div")
 

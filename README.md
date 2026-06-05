@@ -1,7 +1,7 @@
 # poe2-collector
 
-Polls [poe.ninja](https://poe.ninja) for PoE2 price data every 30 minutes and writes
-timestamped JSONL snapshots locally.
+Polls [poe.ninja](https://poe.ninja) for PoE2 price data and writes timestamped JSONL
+snapshots locally, then generates an HTML investment analysis report.
 
 ## Setup
 
@@ -12,22 +12,30 @@ pip install requests
 ## Quick start
 
 ```bash
+# One-shot poll (verify connectivity, refresh data)
+python collect.py --once
+
 # Collect for 4 hours (8 snapshots at 30-min intervals), then exit
 python collect.py --hours 4
 
 # Run forever until Ctrl-C
 python collect.py
 
-# One-shot probe (useful to verify connectivity)
-python collect.py --once
-
 # Different league or poll interval
-python collect.py --league "Standard" --interval 1800
+python collect.py --league "Standard" --interval 900
+
+# Generate investment report (reads data/, writes report.html)
+python report.py
+
+# Report options
+python report.py --data-dir ./data --out my.html --min-vol 1.0
 ```
 
 ## Output
 
-All data lands in `./data/` as JSONL files (one JSON object per line):
+### Hourly snapshots — `data/<stem>.jsonl`
+
+One JSON record per poll per category. Each record has the full poe.ninja API response:
 
 | File | Category |
 |---|---|
@@ -38,38 +46,71 @@ All data lands in `./data/` as JSONL files (one JSON object per line):
 | `soul_cores.jsonl` | Soul Cores |
 | `idols.jsonl` | Idols |
 | `omens.jsonl` | Omens |
+| `abyssal_bones.jsonl` | Abyssal Bones |
+| `expedition.jsonl` | Expedition currency |
+| `liquid_emotions.jsonl` | Liquid Emotions |
+| `catalysts.jsonl` | Catalysts |
+| `verisium.jsonl` | Verisium |
 | `skill_gems.jsonl` | Skill Gems |
 | `unique_weapons.jsonl` | Unique Weapons |
 | `unique_armours.jsonl` | Unique Armours |
 | `unique_jewellery.jsonl` | Unique Jewellery |
 | `divination_cards.jsonl` | Divination Cards |
 
-Each record:
 ```json
 {
   "ts": "2026-06-04T14:30:00Z",
-  "league": "Return of the Ancients",
+  "league": "Runes of Aldur",
   "category": "Currency",
-  "core": { "version": "1.0", "timestamp": 1749047400, ... },
-  "lines": [ { "id": "divine", "primaryValue": 1.0, "volumePrimaryValue": 1480 }, ... ],
-  "items": [ { "id": "divine", "name": "Divine Orb", "icon": "...", "tradeId": "divine" }, ... ]
+  "lines": [ { "id": "divine", "primaryValue": 1.0, "volumePrimaryValue": 82011 }, ... ],
+  "items": [ { "id": "divine", "name": "Divine Orb", "detailsId": "divine-orb" }, ... ],
+  "core": { "primary": "divine", "rates": { "exalted": 79.6, "chaos": 23.02 } }
 }
 ```
 
-### Price interpretation (currency endpoints)
+All `primaryValue` fields are divine-denominated. Convert to exalted via
+`primaryValue * core.rates.exalted`.
 
-```python
-# primaryValue >= 1  →  chaos per item  (e.g. Divine = 185.0 chaos)
-# primaryValue <  1  →  items per chaos  (e.g. Scroll of Wisdom = 0.02 = 50 per chaos)
-chaos_value = pv if pv >= 1 else 1 / pv
+### Detail records — `data/details/<stem>.jsonl`
+
+One record per item, fetched once per item ID and updated when new IDs appear. Contains
+embedded daily price history vs each base currency:
+
+```json
+{
+  "ts": "2026-06-04T14:30:00Z",
+  "league": "Runes of Aldur",
+  "id": "architects-orb",
+  "details": {
+    "item": { "name": "Architect's Orb" },
+    "pairs": [
+      {
+        "id": "exalted",
+        "rate": 39.94,
+        "volumePrimaryValue": 181.6,
+        "history": [
+          { "timestamp": "2026-06-04T00:00:00Z", "rate": 39.94, "volumePrimaryValue": 181.1 }
+        ]
+      }
+    ]
+  }
+}
 ```
 
-Item endpoints (`chaosValue` field) are already in chaos directly.
+## Investment Report
+
+`report.py` reads both data layers for the currency-type categories, runs linear regression
+on price history, and generates a self-contained `report.html` with:
+
+- Sortable table: trend %/day, volatility (CV), score, inline sparklines
+- Score = `trend_pct_per_day / (CV + 0.01)` — rewards fast, consistent appreciation
+- "Both Up" badge: items trending positive vs both Exalted and Divine
+- Filter controls: "Both Up" checkbox, min avg-volume slider, min trend/day sliders
 
 ## Analysis
 
 ```bash
-# Summary of all collected files
+# Summary of all collected snapshot files
 python analyze.py
 
 # Show latest snapshot for a category
@@ -85,7 +126,7 @@ python analyze.py unique_weapons "Atziri's Disfavour"
 
 - poe.ninja data refreshes approximately every hour; polling every 30 min gives
   ~2 samples per update window with minimal wasted requests.
-- The PoE2 endpoints (`/poe2/api/economy/`) are undocumented but stable since 2025.
-- Rate limit appears to be ~12 requests per 5 minutes; the 1-second delay between
-  category fetches keeps a full poll well within that budget.
-- Current league: **Return of the Ancients** (0.5.0, launched May 29 2026)
+- Rate limit is ~12 requests per 5 minutes; the 1-second delay between category
+  fetches keeps a full poll well within budget.
+- 404s on unique weapon/armour detail fetches are expected — base-type variants
+  from prior leagues stay cached locally but are no longer listed by poe.ninja.
