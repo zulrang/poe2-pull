@@ -3,10 +3,11 @@
 report.py — Generate an HTML investment analysis report for PoE2 currency items.
 
 Usage:
-    python report.py                    # reads data/details/, writes report.html
-    python report.py --data-dir ./data  # override data dir
-    python report.py --out my.html      # override output path
-    python report.py --min-vol 1.0      # override minimum avg volume filter
+    python report.py                              # reads data/details/, writes report.html
+    python report.py --data-dir ./data            # override data dir
+    python report.py --out my.html                # override output path
+    python report.py --min-vol 1.0                # override minimum avg volume filter
+    python report.py --league-start 2026-05-23    # enable league day counter in header
 """
 
 import argparse
@@ -84,6 +85,40 @@ def load_hourly(data_dir: Path) -> dict[str, dict[str, list[dict]]]:
     return result
 
 
+def merge_series(history: list[dict], extra: list[dict] | None = None) -> list[dict]:
+    """Merge, sort, and deduplicate time-series points by timestamp."""
+    all_pts = list(history) + (extra or [])
+    seen: dict[str, dict] = {}
+    for pt in all_pts:
+        ts = pt.get("timestamp", "")
+        if ts:
+            seen[ts] = pt
+    return sorted(seen.values(), key=lambda x: x.get("timestamp", ""))
+
+
+def ts_to_epoch(ts_str: str) -> int:
+    try:
+        return int(datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return 0
+
+
+def series_to_compact(merged: list[dict]) -> list[dict]:
+    """Convert merged series to compact {t, r, v} format, limited to last 7 days."""
+    cutoff = datetime.now(timezone.utc).timestamp() - 7 * 86400
+    result = []
+    for p in merged:
+        ts = p.get("timestamp", "")
+        rate = p.get("rate")
+        if not ts or not rate:
+            continue
+        epoch = ts_to_epoch(ts)
+        if epoch < cutoff:
+            continue
+        result.append({"t": epoch, "r": round(rate, 6), "v": round(p.get("volumePrimaryValue", 0), 4)})
+    return result
+
+
 def linreg_slope(xs: list[float], ys: list[float]) -> float:
     n = len(xs)
     if n < 2:
@@ -96,16 +131,9 @@ def linreg_slope(xs: list[float], ys: list[float]) -> float:
 
 
 def analyze_pair(history: list[dict], min_vol: float, extra: list[dict] | None = None) -> dict | None:
-    all_pts = list(history) + (extra or [])
-    if len(all_pts) < 3:
+    sorted_h = merge_series(history, extra)
+    if len(sorted_h) < 3:
         return None
-
-    # Sort, then deduplicate by exact timestamp (keep last seen value per timestamp)
-    all_pts.sort(key=lambda x: x.get("timestamp", ""))
-    seen: dict[str, dict] = {}
-    for pt in all_pts:
-        seen[pt.get("timestamp", "")] = pt
-    sorted_h = sorted(seen.values(), key=lambda x: x.get("timestamp", ""))
 
     rates = [h["rate"] for h in sorted_h if "rate" in h]
     vols  = [h.get("volumePrimaryValue", 0) for h in sorted_h]
@@ -121,7 +149,6 @@ def analyze_pair(history: list[dict], min_vol: float, extra: list[dict] | None =
     if mean_rate == 0:
         return None
 
-    # Time-based regression: x-axis is days since oldest point
     timestamps = [h.get("timestamp", "") for h in sorted_h if "rate" in h]
     t0 = datetime.fromisoformat(timestamps[0].replace("Z", "+00:00"))
 
@@ -132,7 +159,7 @@ def analyze_pair(history: list[dict], min_vol: float, extra: list[dict] | None =
             return 0.0
 
     xs = [to_days(ts) for ts in timestamps]
-    slope = linreg_slope(xs, rates)  # rate change per day
+    slope = linreg_slope(xs, rates)
     trend_pct = slope / mean_rate * 100
 
     variance = sum((r - mean_rate) ** 2 for r in rates) / len(rates)
@@ -147,35 +174,6 @@ def analyze_pair(history: list[dict], min_vol: float, extra: list[dict] | None =
         "rates": rates,
         "timestamps": timestamps,
     }
-
-
-def make_sparkline(rates: list[float], width: int = 80, height: int = 30) -> str:
-    if len(rates) < 2:
-        return ""
-    # Downsample to keep SVG compact
-    MAX_PTS = 80
-    if len(rates) > MAX_PTS:
-        step = (len(rates) - 1) / (MAX_PTS - 1)
-        rates = [rates[round(i * step)] for i in range(MAX_PTS)]
-    mn, mx = min(rates), max(rates)
-    r_range = mx - mn
-
-    def sx(i: int) -> float:
-        return i / (len(rates) - 1) * width
-
-    def sy(r: float) -> float:
-        if r_range == 0:
-            return height / 2
-        return height - (r - mn) / r_range * height
-
-    points = " ".join(f"{sx(i):.1f},{sy(r):.1f}" for i, r in enumerate(rates))
-    color = "#4ade80" if rates[-1] >= rates[0] else "#f87171"
-    return (
-        f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
-        f'xmlns="http://www.w3.org/2000/svg">'
-        f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="1.5"/>'
-        f'</svg>'
-    )
 
 
 def build_rows(items: list[dict], min_vol: float, data_dir: Path) -> tuple[list[dict], str, str, str]:
@@ -207,23 +205,22 @@ def build_rows(items: list[dict], min_vol: float, data_dir: Path) -> tuple[list[
         if "exalted" not in analyses:
             continue
 
-        ex = analyses["exalted"]
-        div = analyses.get("divine")
-
-        both_up = ex["trend_pct"] > 0 and div is not None and div["trend_pct"] > 0
+        ex_pair = pair_map.get("exalted")
+        div_pair = pair_map.get("divine")
+        series_ex = series_to_compact(merge_series(
+            ex_pair.get("history", []) if ex_pair else [],
+            hourly_item.get("exalted"),
+        ))
+        series_div = series_to_compact(merge_series(
+            div_pair.get("history", []) if div_pair else [],
+            hourly_item.get("divine"),
+        ))
 
         rows.append({
             "name": item_info.get("name") or record.get("id", ""),
             "category": record.get("stem", ""),
-            "rate_ex": ex["current_rate"],
-            "rate_div": div["current_rate"] if div else None,
-            "trend_ex": ex["trend_pct"],
-            "trend_div": div["trend_pct"] if div else None,
-            "cv_ex": ex["cv"],
-            "avg_vol_ex": ex["avg_vol"],
-            "score_ex": ex["score"],
-            "sparkline": make_sparkline(ex["rates"]),
-            "both_up": both_up,
+            "series_ex": series_ex,
+            "series_div": series_div,
         })
 
     all_timestamps = [t for t in all_timestamps if t]
@@ -232,36 +229,29 @@ def build_rows(items: list[dict], min_vol: float, data_dir: Path) -> tuple[list[
     return rows, league, date_min, date_max
 
 
-def generate_html(rows: list[dict], league: str, date_min: str, date_max: str, generated_at: str) -> str:
-    total = len(rows)
-    both_up_count = sum(1 for r in rows if r["both_up"])
-
+def generate_html(
+    rows: list[dict],
+    league: str,
+    date_min: str,
+    date_max: str,
+    generated_at: str,
+    league_start: str = "",
+) -> str:
     rows_json = json.dumps(
-        [
-            {
-                "name": r["name"],
-                "category": r["category"],
-                "rate_ex": r["rate_ex"],
-                "rate_div": r["rate_div"],
-                "trend_ex": r["trend_ex"],
-                "trend_div": r["trend_div"],
-                "cv_ex": r["cv_ex"],
-                "avg_vol_ex": r["avg_vol_ex"],
-                "score_ex": r["score_ex"],
-                "both_up": r["both_up"],
-                "sparkline": r["sparkline"],
-            }
-            for r in rows
-        ],
+        [{"name": r["name"], "category": r["category"],
+          "series_ex": r["series_ex"], "series_div": r["series_div"]}
+         for r in rows],
         ensure_ascii=False,
+        separators=(",", ":"),
     )
+    league_start_json = f'"{league_start}"' if league_start else "null"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PoE2 Investment Report — {league}</title>
+<title>PoE2 Investment Report - {league}</title>
 <style>
 :root {{
   --bg:      #0f0f1e;
@@ -276,6 +266,8 @@ def generate_html(rows: list[dict], league: str, date_min: str, date_max: str, g
   --dim:     #7a7068;
   --green:   #4ade80;
   --red:     #f87171;
+  --orange:  #fb923c;
+  --blue:    #60a5fa;
 }}
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 body {{
@@ -302,6 +294,18 @@ header h1 {{
 }}
 .meta {{ color: var(--dim); font-size: 12px; }}
 .meta strong {{ color: var(--text); }}
+.league-day {{
+  display: inline-block;
+  background: var(--card);
+  border: 1px solid var(--border);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 10px;
+  margin-left: 8px;
+  letter-spacing: .04em;
+}}
 /* ---- summary cards ---- */
 .cards {{
   display: flex;
@@ -366,10 +370,54 @@ header h1 {{
 }}
 .slider-group input[type=range] {{
   accent-color: var(--accent);
-  width: 130px;
+  width: 120px;
   cursor: pointer;
 }}
-.slider-val {{ color: var(--accent); min-width: 38px; display: inline-block; }}
+.slider-val {{ color: var(--accent); min-width: 42px; display: inline-block; }}
+/* ---- window toggle ---- */
+.preset-btn {{
+  background: transparent;
+  border: 1px solid var(--accent2);
+  color: var(--accent);
+  padding: 4px 14px;
+  font-size: 12px;
+  font-family: inherit;
+  font-weight: 600;
+  letter-spacing: .04em;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: background .1s;
+  user-select: none;
+}}
+.preset-btn:hover {{ background: var(--accent2); }}
+.window-group {{
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--dim);
+  font-size: 12px;
+}}
+.window-btns {{
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}}
+.window-btn {{
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border);
+  color: var(--dim);
+  padding: 4px 13px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background .1s, color .1s;
+  user-select: none;
+}}
+.window-btn:last-child {{ border-right: none; }}
+.window-btn:hover {{ background: var(--hover); color: var(--text); }}
+.window-btn.active {{ background: var(--accent2); color: var(--accent); font-weight: 600; }}
 /* ---- table ---- */
 .table-wrap {{
   padding: 0 32px 40px;
@@ -402,8 +450,8 @@ th {{
 }}
 th:hover {{ color: var(--accent); }}
 th.sort-active {{ color: var(--accent); }}
-th.sort-active::after {{ content: ' ↓'; font-size: 11px; }}
-th.sort-asc::after  {{ content: ' ↑'; font-size: 11px; }}
+th.sort-active::after {{ content: ' \2193'; font-size: 11px; }}
+th.sort-asc::after  {{ content: ' \2191'; font-size: 11px; }}
 td {{
   padding: 6px 12px;
   border-bottom: 1px solid var(--border);
@@ -416,9 +464,13 @@ tr:hover td {{ background: var(--hover); }}
 .c-rate  {{ font-variant-numeric: tabular-nums; }}
 .c-score {{ font-weight: 600; }}
 .c-vol   {{ color: var(--dim); }}
-.pos {{ color: var(--green); }}
-.neg {{ color: var(--red); }}
-.neu {{ color: var(--dim); }}
+.pos  {{ color: var(--green); }}
+.neg  {{ color: var(--red); }}
+.neu  {{ color: var(--dim); }}
+.warn {{ color: var(--orange); }}
+.regime-m {{ color: var(--accent); font-weight: 600; }}
+.regime-r {{ color: var(--blue); font-weight: 600; }}
+.regime-n {{ color: var(--dim); }}
 .badge {{
   display: inline-block;
   background: #1a3a1a;
@@ -439,6 +491,7 @@ tr:hover td {{ background: var(--hover); }}
   <h1>PoE2 Currency Investment Report</h1>
   <div class="meta">
     League: <strong>{league}</strong>
+    <span id="league-day-badge"></span>
     &nbsp;&middot;&nbsp;Data range: <strong>{date_min}</strong> &rarr; <strong>{date_max}</strong>
     &nbsp;&middot;&nbsp;Generated: {generated_at}
   </div>
@@ -447,33 +500,63 @@ tr:hover td {{ background: var(--hover); }}
 <div class="cards">
   <div class="card">
     <div class="lbl">Items Analyzed</div>
-    <div class="val" id="cnt-total">{total}</div>
+    <div class="val" id="cnt-total">0</div>
   </div>
   <div class="card">
     <div class="lbl">Both Trending Up</div>
-    <div class="val" id="cnt-both">{both_up_count}</div>
+    <div class="val" id="cnt-both">0</div>
+  </div>
+  <div class="card">
+    <div class="lbl">Momentum Plays</div>
+    <div class="val" id="cnt-momentum">0</div>
   </div>
 </div>
 
 <div class="controls">
+  <div class="window-group">
+    <span>Preset:</span>
+    <button class="preset-btn" id="preset-chase">Chase</button>
+    <button class="preset-btn" id="preset-fade">Fade</button>
+  </div>
+  <div class="window-group">
+    <span>Window:</span>
+    <div class="window-btns">
+      <button class="window-btn active" data-hours="168">7d</button>
+      <button class="window-btn" data-hours="72">3d</button>
+      <button class="window-btn" data-hours="24">24h</button>
+    </div>
+  </div>
   <label>
-    <input type="checkbox" id="chk-both">
-    Show only &ldquo;Both Up&rdquo; items
+    <input type="checkbox" id="chk-both" checked>
+    Only &ldquo;Both Up&rdquo;
   </label>
+  <div class="window-group">
+    <span>Regime:</span>
+    <div class="window-btns">
+      <button class="window-btn active" data-regime="M">M</button>
+      <button class="window-btn active" data-regime="R">R</button>
+      <button class="window-btn active" data-regime="~">~</button>
+    </div>
+  </div>
   <div class="slider-group">
-    <span>Min avg vol (Ex):</span>
+    <span>Min vol (Ex):</span>
     <input type="range" id="vol-slider" min="0" max="100" step="0.5" value="0">
     <span class="slider-val" id="vol-val">0.0</span>
   </div>
   <div class="slider-group">
-    <span>Min trend/day (Ex):</span>
+    <span>Min Sharpe:</span>
+    <input type="range" id="sharpe-slider" min="-3" max="3" step="0.1" value="0">
+    <span class="slider-val" id="sharpe-val">0.0</span>
+  </div>
+  <div class="slider-group">
+    <span>Min trend (Ex):</span>
     <input type="range" id="trend-ex-slider" min="-20" max="20" step="0.1" value="-20">
     <span class="slider-val" id="trend-ex-val">-20.0%</span>
   </div>
   <div class="slider-group">
-    <span>Min trend/day (Div):</span>
-    <input type="range" id="trend-div-slider" min="-20" max="20" step="0.1" value="-20">
-    <span class="slider-val" id="trend-div-val">-20.0%</span>
+    <span>Min trend (Div):</span>
+    <input type="range" id="trend-div-slider" min="-20" max="20" step="0.1" value="0">
+    <span class="slider-val" id="trend-div-val">+0.0%</span>
   </div>
 </div>
 
@@ -485,30 +568,55 @@ tr:hover td {{ background: var(--hover); }}
   <th data-col="category">Category</th>
   <th data-col="rate_ex">Rate (Ex)</th>
   <th data-col="rate_div">Rate (Div)</th>
-  <th data-col="trend_ex">Trend/day (Ex)</th>
-  <th data-col="trend_div">Trend/day (Div)</th>
-  <th data-col="cv_ex" data-default-asc="true">Volatility CV</th>
+  <th data-col="trend_ex" title="Log-return trend per day, recency-weighted">Trend/day (Ex)</th>
+  <th data-col="trend_div" title="Divine-denominated trend = excess return vs divine inflation">Trend/day (Div) *</th>
+  <th data-col="momentum" title="Recent 25% of window avg vs older 75% avg">Momentum</th>
+  <th data-col="sharpe" title="Mean log-return / std log-return (Sharpe equivalent)">Sharpe</th>
+  <th data-col="max_dd" title="Largest peak-to-trough drop in window">Max DD</th>
+  <th data-col="regime" title="Lag-1 autocorrelation: M=momentum (trend continues), R=reversion (fades), ~=unclear">Regime</th>
   <th data-col="avg_vol_ex">Avg Vol (Ex)</th>
-  <th data-col="score_ex">Score</th>
+  <th data-col="score_ex" title="Sharpe x log(1 + avg_vol) — risk-adjusted, volume-weighted">Score</th>
   <th>Sparkline (Ex)</th>
   <th></th>
 </tr>
 </thead>
 <tbody id="tbody"></tbody>
 </table>
+<div style="color:var(--dim);font-size:11px;padding:10px 0 0 2px">
+  * Trend/day (Div) measures appreciation in divine terms, stripping out divine/exalted inflation. Use this as the inflation-adjusted signal.
+</div>
 </div>
 
 <script>
 const DATA = {rows_json};
+const LEAGUE_START = {league_start_json};
+
+// League day display
+(function() {{
+  if (!LEAGUE_START) return;
+  const start = new Date(LEAGUE_START + 'T00:00:00Z');
+  const day = Math.floor((Date.now() - start.getTime()) / 86400000) + 1;
+  if (day < 1) return;
+  const phase = day <= 14 ? 'Early' : day <= 45 ? 'Mid' : 'Late';
+  const badge = document.getElementById('league-day-badge');
+  badge.innerHTML = '<span class="league-day">Day ' + day + ' — ' + phase + ' League</span>';
+}})();
 
 let sortCol = 'score_ex';
 let sortAsc = false;
-let onlyBothUp = false;
+let onlyBothUp = true;
 let minVol = 0;
+let minSharpe = 0;
 let minTrendEx = -20;
-let minTrendDiv = -20;
+let minTrendDiv = 0;
+let selectedRegimes = new Set(['M', 'R', '~']);
+let windowHours = 168;
 
-function fmt(v, digits) {{
+// Recency-decay constant: half-life ~1.4 days.
+// A 7-day-old point gets ~3% weight vs a current point.
+const DECAY = 0.5;
+
+function fmt(v) {{
   if (v == null) return '—';
   if (v === 0) return '0';
   const abs = Math.abs(v);
@@ -519,9 +627,19 @@ function fmt(v, digits) {{
   return v.toPrecision(3);
 }}
 
-function fmtTrend(v) {{
+function fmtPct(v) {{
   if (v == null) return '—';
   return (v >= 0 ? '+' : '') + v.toFixed(2) + '%';
+}}
+
+function fmtSharpe(v) {{
+  if (v == null) return '—';
+  return (v >= 0 ? '+' : '') + v.toFixed(2);
+}}
+
+function fmtDD(v) {{
+  if (v == null) return '—';
+  return v.toFixed(1) + '%';
 }}
 
 function trendCls(v) {{
@@ -529,10 +647,178 @@ function trendCls(v) {{
   return v > 0 ? 'pos' : 'neg';
 }}
 
+function ddCls(v) {{
+  if (v == null) return 'neu';
+  if (v > 25) return 'neg';
+  if (v > 10) return 'warn';
+  return 'neu';
+}}
+
+function regimeCls(r) {{
+  if (r === 'M') return 'regime-m';
+  if (r === 'R') return 'regime-r';
+  return 'regime-n';
+}}
+
+function makeSparklineSVG(rates) {{
+  const W = 80, H = 30;
+  if (!rates || rates.length < 2) return '';
+  let rs = rates;
+  const MAX_PTS = 80;
+  if (rs.length > MAX_PTS) {{
+    const step = (rs.length - 1) / (MAX_PTS - 1);
+    rs = Array.from({{length: MAX_PTS}}, (_, i) => rs[Math.round(i * step)]);
+  }}
+  const mn = Math.min(...rs), mx = Math.max(...rs);
+  const rng = mx - mn;
+  const sx = i => (i / (rs.length - 1) * W).toFixed(1);
+  const sy = r => (rng === 0 ? H / 2 : H - (r - mn) / rng * H).toFixed(1);
+  const pts = rs.map((r, i) => sx(i) + ',' + sy(r)).join(' ');
+  const color = rs[rs.length - 1] >= rs[0] ? '#4ade80' : '#f87171';
+  return '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H +
+    '" xmlns="http://www.w3.org/2000/svg"><polyline points="' + pts +
+    '" fill="none" stroke="' + color + '" stroke-width="1.5"/></svg>';
+}}
+
+function analyzeWindow(series, hours) {{
+  if (!series || series.length === 0) return null;
+  const cutoff = Date.now() / 1000 - hours * 3600;
+  const pts = series.filter(p => p.t >= cutoff);
+  if (pts.length < 3) return null;
+
+  const n = pts.length;
+  const rates = pts.map(p => p.r);
+  const vols  = pts.map(p => p.v);
+  const avgVol = vols.reduce((a, b) => a + b, 0) / n;
+
+  // Log prices for regression (% interpretation, scale-invariant)
+  const logRates = rates.map(r => Math.log(r));
+  const tLast = pts[n - 1].t;
+  const t0    = pts[0].t;
+  const xs    = pts.map(p => (p.t - t0) / 86400);  // days since first point
+
+  // Recency weights: exp(-DECAY * days_from_end)
+  const ws   = pts.map(p => Math.exp(-DECAY * (tLast - p.t) / 86400));
+  const wSum = ws.reduce((a, b) => a + b, 0);
+
+  // Weighted means
+  const wxm = xs.reduce((s, x, i) => s + ws[i] * x, 0) / wSum;
+  const wym = logRates.reduce((s, y, i) => s + ws[i] * y, 0) / wSum;
+
+  // Weighted OLS — slope = log-return per day ~= % per day
+  const num = xs.reduce((s, x, i) => s + ws[i] * (x - wxm) * (logRates[i] - wym), 0);
+  const den = xs.reduce((s, x, i) => s + ws[i] * (x - wxm) * (x - wxm), 0);
+  const slope = den ? num / den : 0;
+  const trendPct = slope * 100;
+
+  // Log returns for Sharpe and regime
+  const logReturns = [];
+  for (let i = 1; i < n; i++) {{
+    if (rates[i] > 0 && rates[i - 1] > 0)
+      logReturns.push(Math.log(rates[i] / rates[i - 1]));
+  }}
+
+  // Sharpe: mean / std of log returns
+  let sharpe = null;
+  let stdLR = 0;
+  let meanLR = 0;
+  if (logReturns.length >= 3) {{
+    meanLR = logReturns.reduce((a, b) => a + b, 0) / logReturns.length;
+    const varLR = logReturns.reduce((s, r) => s + (r - meanLR) * (r - meanLR), 0) / logReturns.length;
+    stdLR = Math.sqrt(varLR);
+    sharpe = stdLR > 0 ? meanLR / stdLR : 0;
+  }}
+
+  // CV (kept as fallback)
+  const meanRate = rates.reduce((a, b) => a + b, 0) / n;
+  const varRate  = rates.reduce((s, r) => s + (r - meanRate) * (r - meanRate), 0) / n;
+  const cv = meanRate > 0 ? Math.sqrt(varRate) / meanRate : 0;
+
+  // Max drawdown: largest peak-to-trough drop
+  let peak = rates[0], maxDD = 0;
+  for (const r of rates) {{
+    if (r > peak) peak = r;
+    const dd = (peak - r) / peak;
+    if (dd > maxDD) maxDD = dd;
+  }}
+
+  // Momentum: recent 25% of points vs older 75%
+  const split = Math.max(1, Math.floor(n * 0.75));
+  const oldSlice = rates.slice(0, split);
+  const newSlice = rates.slice(split);
+  const oldAvg = oldSlice.reduce((a, b) => a + b, 0) / oldSlice.length;
+  const newAvg = newSlice.reduce((a, b) => a + b, 0) / newSlice.length;
+  const momentum = oldAvg > 0 ? (newAvg - oldAvg) / oldAvg * 100 : null;
+
+  // Regime: lag-1 autocorrelation of log returns
+  let autocorr = null;
+  if (logReturns.length >= 6) {{
+    const m = logReturns.reduce((a, b) => a + b, 0) / logReturns.length;
+    const lag0 = logReturns.reduce((s, r) => s + (r - m) * (r - m), 0);
+    const lag1 = logReturns.slice(0, -1).reduce((s, r, i) => s + (r - m) * (logReturns[i + 1] - m), 0);
+    autocorr = lag0 > 0 ? lag1 / lag0 : 0;
+  }}
+
+  // Volume-weighted score: Sharpe * log(1 + avgVol)
+  // Falls back to classic trend/cv when Sharpe is unavailable
+  const volFactor = Math.log(1 + avgVol);
+  const score = sharpe != null
+    ? sharpe * volFactor
+    : trendPct / (cv + 0.01);
+
+  return {{
+    trend_pct: trendPct,
+    sharpe,
+    cv,
+    avg_vol: avgVol,
+    score,
+    current_rate: rates[n - 1],
+    max_dd: maxDD * 100,
+    momentum,
+    autocorr,
+    rates,
+  }};
+}}
+
+function computeRows() {{
+  return DATA.map(d => {{
+    const ex = analyzeWindow(d.series_ex, windowHours);
+    if (!ex) return null;
+    const div = analyzeWindow(d.series_div, windowHours);
+
+    // Regime from autocorrelation (|ac| >= 0.2 threshold to filter noise)
+    let regime = '~';
+    if (ex.autocorr != null) {{
+      if (ex.autocorr >  0.2) regime = 'M';
+      else if (ex.autocorr < -0.2) regime = 'R';
+    }}
+
+    return {{
+      name:        d.name,
+      category:    d.category,
+      rate_ex:     ex.current_rate,
+      rate_div:    div ? div.current_rate : null,
+      trend_ex:    ex.trend_pct,
+      trend_div:   div ? div.trend_pct : null,
+      momentum:    ex.momentum,
+      sharpe:      ex.sharpe,
+      max_dd:      ex.max_dd,
+      regime,
+      avg_vol_ex:  ex.avg_vol,
+      score_ex:    ex.score,
+      both_up:     ex.trend_pct > 0 && div != null && div.trend_pct > 0,
+      sparkline:   makeSparklineSVG(ex.rates),
+    }};
+  }}).filter(r => r !== null);
+}}
+
 function render() {{
-  let rows = DATA.filter(r => {{
+  const computed = computeRows();
+  let rows = computed.filter(r => {{
     if (onlyBothUp && !r.both_up) return false;
     if (r.avg_vol_ex < minVol) return false;
+    if (r.sharpe == null || r.sharpe < minSharpe) return false;
+    if (!selectedRegimes.has(r.regime)) return false;
     if (r.trend_ex == null || r.trend_ex < minTrendEx) return false;
     if (minTrendDiv > -20 && (r.trend_div == null || r.trend_div < minTrendDiv)) return false;
     return true;
@@ -554,17 +840,22 @@ function render() {{
   <td class="c-cat">${{r.category}}</td>
   <td class="c-rate">${{fmt(r.rate_ex)}}</td>
   <td class="c-rate">${{fmt(r.rate_div)}}</td>
-  <td class="${{trendCls(r.trend_ex)}}">${{fmtTrend(r.trend_ex)}}</td>
-  <td class="${{trendCls(r.trend_div)}}">${{fmtTrend(r.trend_div)}}</td>
-  <td>${{r.cv_ex.toFixed(3)}}</td>
+  <td class="${{trendCls(r.trend_ex)}}">${{fmtPct(r.trend_ex)}}</td>
+  <td class="${{trendCls(r.trend_div)}}">${{fmtPct(r.trend_div)}}</td>
+  <td class="${{trendCls(r.momentum)}}">${{fmtPct(r.momentum)}}</td>
+  <td class="${{trendCls(r.sharpe)}}">${{fmtSharpe(r.sharpe)}}</td>
+  <td class="${{ddCls(r.max_dd)}}">${{fmtDD(r.max_dd)}}</td>
+  <td class="${{regimeCls(r.regime)}}" title="${{r.regime === 'M' ? 'Momentum: trend tends to continue' : r.regime === 'R' ? 'Reversion: price tends to mean-revert' : 'No clear pattern'}}">${{r.regime}}</td>
   <td class="c-vol">${{r.avg_vol_ex.toFixed(2)}}</td>
-  <td class="c-score">${{r.score_ex.toFixed(2)}}</td>
+  <td class="c-score">${{r.score_ex != null ? r.score_ex.toFixed(2) : '—'}}</td>
   <td>${{r.sparkline}}</td>
   <td>${{r.both_up ? '<span class="badge">Both Up</span>' : ''}}</td>
 </tr>`).join('');
 
   document.getElementById('cnt-total').textContent = rows.length;
   document.getElementById('cnt-both').textContent = rows.filter(r => r.both_up).length;
+  document.getElementById('cnt-momentum').textContent =
+    rows.filter(r => r.regime === 'M' && r.trend_ex > 0).length;
 }}
 
 // Column sort
@@ -585,28 +876,32 @@ document.querySelectorAll('th[data-col]').forEach(th => {{
   }});
 }});
 
-// Mark initial sort column
 const initialTh = document.querySelector('th[data-col="score_ex"]');
 if (initialTh) initialTh.classList.add('sort-active');
 
-// Checkbox
 document.getElementById('chk-both').addEventListener('change', e => {{
   onlyBothUp = e.target.checked;
   render();
 }});
 
-// Volume slider
-const slider = document.getElementById('vol-slider');
-const volVal = document.getElementById('vol-val');
-slider.addEventListener('input', () => {{
-  minVol = parseFloat(slider.value);
+const volSlider = document.getElementById('vol-slider');
+const volVal    = document.getElementById('vol-val');
+volSlider.addEventListener('input', () => {{
+  minVol = parseFloat(volSlider.value);
   volVal.textContent = minVol.toFixed(1);
   render();
 }});
 
-// Trend sliders
+const sharpeSlider = document.getElementById('sharpe-slider');
+const sharpeVal    = document.getElementById('sharpe-val');
+sharpeSlider.addEventListener('input', () => {{
+  minSharpe = parseFloat(sharpeSlider.value);
+  sharpeVal.textContent = (minSharpe >= 0 ? '+' : '') + minSharpe.toFixed(1);
+  render();
+}});
+
 const trendExSlider = document.getElementById('trend-ex-slider');
-const trendExVal = document.getElementById('trend-ex-val');
+const trendExVal    = document.getElementById('trend-ex-val');
 trendExSlider.addEventListener('input', () => {{
   minTrendEx = parseFloat(trendExSlider.value);
   trendExVal.textContent = (minTrendEx >= 0 ? '+' : '') + minTrendEx.toFixed(1) + '%';
@@ -614,11 +909,72 @@ trendExSlider.addEventListener('input', () => {{
 }});
 
 const trendDivSlider = document.getElementById('trend-div-slider');
-const trendDivVal = document.getElementById('trend-div-val');
+const trendDivVal    = document.getElementById('trend-div-val');
 trendDivSlider.addEventListener('input', () => {{
   minTrendDiv = parseFloat(trendDivSlider.value);
   trendDivVal.textContent = (minTrendDiv >= 0 ? '+' : '') + minTrendDiv.toFixed(1) + '%';
   render();
+}});
+
+document.querySelectorAll('.window-btn').forEach(btn => {{
+  btn.addEventListener('click', () => {{
+    windowHours = parseInt(btn.dataset.hours);
+    document.querySelectorAll('.window-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    render();
+  }});
+}});
+
+const PRESETS = {{
+  chase: {{ onlyBothUp: true,  regimes: ['M'],       minSharpe: 0,  minTrendDiv: 0,   minTrendEx: -20, minVol: 0 }},
+  fade:  {{ onlyBothUp: false, regimes: ['R'],       minSharpe: -3, minTrendDiv: -20, minTrendEx: -20, minVol: 0 }},
+}};
+
+function applyPreset(cfg) {{
+  onlyBothUp = cfg.onlyBothUp;
+  minSharpe  = cfg.minSharpe;
+  minTrendEx = cfg.minTrendEx;
+  minTrendDiv = cfg.minTrendDiv;
+  minVol = cfg.minVol;
+  selectedRegimes = new Set(cfg.regimes);
+
+  document.getElementById('chk-both').checked = onlyBothUp;
+
+  sharpeSlider.value = minSharpe;
+  sharpeVal.textContent = (minSharpe >= 0 ? '+' : '') + minSharpe.toFixed(1);
+
+  trendExSlider.value = minTrendEx;
+  trendExVal.textContent = (minTrendEx >= 0 ? '+' : '') + minTrendEx.toFixed(1) + '%';
+
+  trendDivSlider.value = minTrendDiv;
+  trendDivVal.textContent = (minTrendDiv >= 0 ? '+' : '') + minTrendDiv.toFixed(1) + '%';
+
+  volSlider.value = minVol;
+  volVal.textContent = minVol.toFixed(1);
+
+  document.querySelectorAll('[data-regime]').forEach(b => {{
+    if (selectedRegimes.has(b.dataset.regime)) b.classList.add('active');
+    else b.classList.remove('active');
+  }});
+
+  render();
+}}
+
+document.getElementById('preset-chase').addEventListener('click', () => applyPreset(PRESETS.chase));
+document.getElementById('preset-fade').addEventListener('click',  () => applyPreset(PRESETS.fade));
+
+document.querySelectorAll('[data-regime]').forEach(btn => {{
+  btn.addEventListener('click', () => {{
+    const r = btn.dataset.regime;
+    if (selectedRegimes.has(r)) {{
+      selectedRegimes.delete(r);
+      btn.classList.remove('active');
+    }} else {{
+      selectedRegimes.add(r);
+      btn.classList.add('active');
+    }}
+    render();
+  }});
 }});
 
 render();
@@ -632,6 +988,8 @@ def main() -> None:
     parser.add_argument("--data-dir", default="data", help="Path to data directory (default: data)")
     parser.add_argument("--out", default="report.html", help="Output HTML file (default: report.html)")
     parser.add_argument("--min-vol", type=float, default=0.5, help="Minimum avg volume filter (default: 0.5)")
+    parser.add_argument("--league-start", default="", metavar="YYYY-MM-DD",
+                        help="League start date for day counter in report header")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -642,11 +1000,10 @@ def main() -> None:
     print(f"  Loaded {len(items)} items across {len(STEMS)} categories")
 
     rows, league, date_min, date_max = build_rows(items, args.min_vol, data_dir)
-    both_up = sum(1 for r in rows if r["both_up"])
-    print(f"  Passed filters (min-vol={args.min_vol}): {len(rows)} items, {both_up} trending up in both Ex + Div")
+    print(f"  Passed filters (min-vol={args.min_vol}): {len(rows)} items with series data")
 
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    html = generate_html(rows, league, date_min, date_max, generated_at)
+    html = generate_html(rows, league, date_min, date_max, generated_at, args.league_start)
 
     out_path.write_text(html, encoding="utf-8")
     print(f"  Report written to {out_path.resolve()}")
